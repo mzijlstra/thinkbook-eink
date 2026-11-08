@@ -10,6 +10,7 @@ change its voltages (VCOM, PMIC, power sequence) are deliberately absent.
 """
 import argparse
 import fcntl
+import glob
 import os
 import struct
 import sys
@@ -41,7 +42,8 @@ MODES = {
 LIVE_MODES = {2, 4, 240}
 DEFAULT_MODE = MODES["browser"]
 REFRESH_SETTLE_S = 1.5
-CONNECTOR = "/sys/class/drm/card1-eDP-2/status"
+# The card number changes when the graphics driver is reloaded, so match any card.
+CONNECTOR_GLOB = "/sys/class/drm/card*-eDP-2/status"
 
 
 def mode_name(number):
@@ -145,12 +147,11 @@ def refresh(tcon, then=None, settle=REFRESH_SETTLE_S, sleep=time.sleep):
     return then
 
 
-def connector_status():
-    try:
-        with open(CONNECTOR) as f:
+def connector_status(pattern=CONNECTOR_GLOB):
+    for path in glob.glob(pattern):
+        with open(path) as f:
             return f.read().strip()
-    except OSError:
-        return "not present"
+    return "not present"
 
 
 def lock():

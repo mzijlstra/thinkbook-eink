@@ -6,6 +6,7 @@ import importlib.machinery
 import importlib.util
 import os
 import struct
+import tempfile
 import unittest
 
 HERE = os.path.dirname(__file__)
@@ -98,6 +99,23 @@ class Commands(unittest.TestCase):
         dev = FakeDevice(replies=[struct.pack("<HH", 17, 0)])
         back = einkctl.refresh(einkctl.Tcon(dev), sleep=lambda s: None)
         self.assertEqual(back, einkctl.DEFAULT_MODE)
+
+
+class Connector(unittest.TestCase):
+
+    def test_finds_edp2_on_any_card(self):
+        # Regression: after an i915 rebind the connector moved from card1 to card0.
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "card0-eDP-2"))
+            with open(os.path.join(d, "card0-eDP-2", "status"), "w") as f:
+                f.write("connected\n")
+            self.assertEqual(einkctl.connector_status(os.path.join(d, "card*-eDP-2/status")),
+                             "connected")
+
+    def test_missing_connector(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(einkctl.connector_status(os.path.join(d, "card*-eDP-2/status")),
+                             "not present")
 
 
 class Parsing(unittest.TestCase):
