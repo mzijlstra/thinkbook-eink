@@ -1,0 +1,5 @@
+# Lenovo ThinkBook Plus Gen 4 IRU e-ink T-CON (ITE, USB 048d:8957).
+# uaccess: the logged-in user may run einkctl without sudo.
+# SYSTEMD_WANTS: switch the panel to its live mode whenever the T-CON appears (boot, resume).
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="048d", ATTR{idProduct}=="8957", \
+  TAG+="uaccess", TAG+="systemd", ENV{SYSTEMD_WANTS}+="einkctl-on.service"

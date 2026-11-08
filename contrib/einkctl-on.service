@@ -1,0 +1,6 @@
+[Unit]
+Description=Switch the ThinkBook e-ink panel to its live mode
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/einkctl on

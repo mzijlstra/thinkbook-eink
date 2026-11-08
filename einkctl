@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""Control the colour e-ink panel of the Lenovo ThinkBook Plus Gen 4 IRU on Linux.
+
+The panel is an ordinary second display (eDP-2) while its T-CON, an ITE IT8951-family chip on
+USB 048d:8957, is in a "MIPI mode" that follows the video signal. This tool sets that mode and
+triggers full refreshes over the T-CON's vendor bulk interface.
+
+Only the mode and refresh commands are implemented. Commands that write the T-CON's flash or
+change its voltages (VCOM, PMIC, power sequence) are deliberately absent.
+"""
+import argparse
+import fcntl
+import os
+import struct
+import sys
+import time
+
+VID, PID = 0x048D, 0x8957
+EP_OUT, EP_IN = 0x02, 0x81
+TAG = 0x89518961
+DIR_IN, DIR_OUT = 0x80, 0x00
+TIMEOUT_MS = 5000
+
+MB_GET_MIPI_MODE = 0x60
+MB_SET_MIPI_MODE = 0x61
+
+# Names as in Lenovo's app. "Live" modes follow the video signal; the others hold the frame
+# taken at the last refresh.
+MODES = {
+    "reader": 0,
+    "mixed": 1,
+    "browser": 2,
+    "fast-reader": 3,
+    "fast-ui": 4,
+    "sleep": 15,
+    "refresh": 17,
+    "standby": 18,
+    "handwriting": 19,
+    "hybrid": 240,
+}
+LIVE_MODES = {2, 4, 240}
+DEFAULT_MODE = MODES["browser"]
+REFRESH_SETTLE_S = 1.5
+CONNECTOR = "/sys/class/drm/card1-eDP-2/status"
+
+
+def mode_name(number):
+    for name, value in MODES.items():
+        if value == number:
+            return name
+    return f"unknown ({number})"
+
+
+def parse_mode(text):
+    if text in MODES:
+        return MODES[text]
+    try:
+        return int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"unknown mode {text!r}; use one of {', '.join(MODES)} or a number") from None
+
+
+def cbw(command, direction, length):
+    """31-byte USB Mass Storage command block wrapper around a 16-byte CDB."""
+    return struct.pack("<IIIBBB16s", 0x43425355, TAG, length, direction, 0, 16,
+                       command.ljust(16, b"\0"))
+
+
+def check_csw(csw):
+    sig, _tag, residue, status = struct.unpack("<IIIB", csw)
+    if sig != 0x53425355 or status != 0:
+        raise RuntimeError(f"T-CON rejected the command (CSW {sig:#x}, status {status}, "
+                           f"residue {residue})")
+
+
+def mailbox_payload(command, *args):
+    """Lenovo mailbox layout: u16 command at byte 0, u16 arguments from byte 4."""
+    return struct.pack(f"<HH{len(args)}H", command, 0, *args).ljust(0x24, b"\0")
+
+
+class Tcon:
+    def __init__(self, dev):
+        self.dev = dev
+
+    @classmethod
+    def open(cls):
+        import usb.core
+        import usb.util
+        dev = usb.core.find(idVendor=VID, idProduct=PID)
+        if dev is None:
+            raise SystemExit("e-ink T-CON (USB 048d:8957) not found")
+        if dev.is_kernel_driver_active(0):
+            dev.detach_kernel_driver(0)
+        usb.util.claim_interface(dev, 0)
+        return cls(dev)
+
+    def close(self):
+        import usb.util
+        usb.util.release_interface(self.dev, 0)
+
+    def transfer(self, command, direction, length=0, data=b""):
+        self.dev.write(EP_OUT, cbw(command, direction, length), timeout=TIMEOUT_MS)
+        result = b""
+        if length:
+            if direction == DIR_IN:
+                result = bytes(self.dev.read(EP_IN, length, timeout=TIMEOUT_MS))
+            else:
+                self.dev.write(EP_OUT, data, timeout=TIMEOUT_MS)
+        check_csw(bytes(self.dev.read(EP_IN, 13, timeout=TIMEOUT_MS)))
+        return result
+
+    def inquiry(self):
+        return self.transfer(bytes([0x12, 0, 0, 0, 0, 0, 0x81]), DIR_IN, 0x28)
+
+    def system_info(self):
+        return self.transfer(bytes([0xFE, 0, 0x38, 0x39, 0x35, 0x31, 0x80, 0, 1, 0, 2, 0]),
+                             DIR_IN, 0x70)
+
+    def mailbox(self, command, *args):
+        data = mailbox_payload(command, *args)
+        self.transfer(bytes([0xFE, 0, 0, 0, 0, 0, 0xA8]), DIR_OUT, len(data), data)
+
+    def read_mailbox(self, length, mailbox_id=0):
+        return self.transfer(bytes([0xFE, 0, 0, 0, 0, 0, 0xA9, mailbox_id,
+                                    length >> 8, length & 0xFF]), DIR_IN, length)
+
+    def get_mode(self):
+        self.mailbox(MB_GET_MIPI_MODE)
+        return struct.unpack("<H", self.read_mailbox(4)[:2])[0]
+
+    def set_mode(self, mode):
+        self.mailbox(MB_SET_MIPI_MODE, mode, 1)
+
+
+def refresh(tcon, then=None, settle=REFRESH_SETTLE_S, sleep=time.sleep):
+    """Full refresh (clears ghosting), then return to `then` or the mode before the refresh."""
+    if then is None:
+        then = tcon.get_mode()
+        if then == MODES["refresh"]:
+            then = DEFAULT_MODE
+    tcon.set_mode(MODES["refresh"])
+    sleep(settle)
+    tcon.set_mode(then)
+    return then
+
+
+def connector_status():
+    try:
+        with open(CONNECTOR) as f:
+            return f.read().strip()
+    except OSError:
+        return "not present"
+
+
+def lock():
+    """Serialise access: two einkctl runs interleaving CBWs would desync the T-CON."""
+    path = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "einkctl.lock")
+    if os.geteuid() == 0:
+        path = "/run/einkctl.lock"
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="einkctl", description=__doc__.splitlines()[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("status", help="show the MIPI mode and the eDP-2 connector")
+    sub.add_parser("info", help="show the T-CON's inquiry and system info")
+    sub.add_parser("on", help=f"switch to the default live mode ({mode_name(DEFAULT_MODE)})")
+    m = sub.add_parser("mode", help="set a MIPI mode")
+    m.add_argument("mode", type=parse_mode, help=", ".join(MODES))
+    r = sub.add_parser("refresh", help="full refresh, then back to the previous mode")
+    r.add_argument("--then", type=parse_mode, help="mode to switch to after the refresh")
+    args = p.parse_args(argv)
+
+    fd = lock()
+    tcon = Tcon.open()
+    try:
+        if args.cmd == "status":
+            print(f"mode      {mode_name(tcon.get_mode())}")
+            print(f"eDP-2     {connector_status()}")
+        elif args.cmd == "info":
+            inq = tcon.inquiry()
+            print("inquiry  ", inq[8:16].decode(errors="replace").strip(),
+                  inq[16:32].decode(errors="replace").strip(),
+                  inq[32:36].decode(errors="replace").strip())
+            words = struct.unpack(">28I", tcon.system_info())
+            print(f"panel     {words[4]}x{words[5]}")
+            print(f"buffer    {words[6]:#x}")
+        elif args.cmd == "on":
+            tcon.set_mode(DEFAULT_MODE)
+        elif args.cmd == "mode":
+            tcon.set_mode(args.mode)
+        elif args.cmd == "refresh":
+            print(f"mode      {mode_name(refresh(tcon, args.then))}")
+    finally:
+        tcon.close()
+        os.close(fd)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
